@@ -571,11 +571,31 @@ class HexEditor:
             return
         
         current_pos = self.search_state['current_pos']
+        
+        # First remove all highlights
+        self.text.tag_remove("highlight", "1.0", tk.END)
+        
         if isinstance(self.search_state['found_positions'][0], tuple):
+            # Advanced search result (pair of positions)
             pos1, pos2 = self.search_state['found_positions'][current_pos]
-            self.editor_highlight_byte(pos1)
-            self.editor_highlight_byte(pos2)
+            
+            # Highlight first position
+            line_num1 = (pos1 // 16) + 3
+            hex_start1 = 10 + (pos1 % 16) * 3
+            hex_end1 = hex_start1 + 2
+            self.text.tag_add("highlight", f"{line_num1}.{hex_start1}", f"{line_num1}.{hex_end1}")
+            
+            # Highlight second position
+            line_num2 = (pos2 // 16) + 3
+            hex_start2 = 10 + (pos2 % 16) * 3
+            hex_end2 = hex_start2 + 2
+            self.text.tag_add("highlight", f"{line_num2}.{hex_start2}", f"{line_num2}.{hex_end2}")
+            
+            # Make sure both lines are visible
+            self.text.see(f"{line_num1}.0")
+            self.text.see(f"{line_num2}.0")
         else:
+            # Simple search result (single position)
             pos = self.search_state['found_positions'][current_pos]
             self.editor_highlight_byte(pos)
         
