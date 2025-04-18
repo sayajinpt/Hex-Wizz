@@ -4,6 +4,136 @@ from tkinter import filedialog, messagebox, simpledialog
 import binascii
 import re
 import string
+from collections import defaultdict
+
+class HexEditorTab:
+    def __init__(self, notebook, editor):
+        self.editor = editor
+        self.frame = ttk.Frame(notebook)
+        self.file_path = None
+        self.content = bytearray()
+        self.original_content = bytearray()
+        self.last_content = bytearray()
+        self.modifications = {}
+        
+        self.text = tk.Text(self.frame, wrap="none", font=("Courier", 10))
+        self.text.pack(expand=1, fill="both", padx=5, pady=5)
+        
+        scrollbar = ttk.Scrollbar(self.text)
+        scrollbar.pack(side="right", fill="y")
+        self.text.config(yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.text.yview)
+        
+        self.text.tag_configure("highlight", background="lightblue")
+        self.text.tag_configure("modified", foreground="orange")
+        self.text.tag_configure("diff", foreground="red")
+        self.text.tag_configure("string_highlight", background="lightgreen")
+        
+        self.text.bind("<KeyRelease>", lambda e: self.track_text_edits())
+        
+    def display_content(self):
+        text = self.text
+        content = self.content
+        
+        text.delete(1.0, tk.END)
+        
+        header = "Offset    "
+        hex_header = ""
+        ascii_header = "  "
+        
+        for i in range(16):
+            hex_header += f"{i:02X} "
+        
+        for i in range(16):
+            ascii_header += f"{i:1X}"
+        
+        text.insert(tk.END, f"{header}{hex_header} {ascii_header}\n")
+        text.insert(tk.END, ("-" * len(header)) + " " + ("-" * len(hex_header)) + " " + ("-" * len(ascii_header)) + "\n")
+        
+        address = 0
+        for i in range(0, len(content), 16):
+            chunk = content[i:i+16]
+            hex_bytes = " ".join(f"{b:02X}" for b in chunk)
+            ascii_bytes = "".join(chr(b) if 32 <= b <= 127 else "." for b in chunk)
+            text.insert(tk.END, f"{address:08X}  {hex_bytes:<48}  {ascii_bytes}\n")
+            address += 16
+
+    def track_text_edits(self):
+        text = self.text
+        
+        cursor_pos = text.index(tk.INSERT)
+        line_num = int(cursor_pos.split('.')[0])
+        
+        if line_num < 3:
+            return
+        
+        offset = (line_num - 3) * 16
+        
+        line_content = text.get(f"{line_num}.0", f"{line_num}.end")
+        
+        hex_part = line_content[10:58]
+        hex_bytes = hex_part.split()
+        
+        for i, byte_str in enumerate(hex_bytes):
+            if len(byte_str) == 2:
+                try:
+                    new_val = int(byte_str, 16)
+                    byte_offset = offset + i
+                    
+                    if byte_offset < len(self.content):
+                        current_val = self.content[byte_offset]
+                        
+                        if new_val != current_val:
+                            self.content[byte_offset] = new_val
+                            
+                            if byte_offset < len(self.original_content):
+                                old_val = self.original_content[byte_offset]
+                                if new_val != old_val:
+                                    self.modifications[byte_offset] = (old_val, new_val)
+                                elif byte_offset in self.modifications:
+                                    del self.modifications[byte_offset]
+                except ValueError:
+                    pass
+        
+        self.last_content = bytearray(self.content)
+        self.highlight_modified_bytes_in_line(line_num)
+        
+        if self.editor.mod_track_tree and self.editor.get_current_tab() == self:
+            self.editor.update_mod_track_window()
+            
+    def highlight_modified_bytes_in_line(self, line_num):
+        text = self.text
+        content = self.content
+        original = self.original_content
+        
+        text.tag_remove("modified", f"{line_num}.0", f"{line_num}.end")
+        
+        offset = (line_num - 3) * 16
+        
+        for i in range(16):
+            byte_offset = offset + i
+            if byte_offset >= len(content) or byte_offset >= len(original):
+                break
+                
+            if content[byte_offset] != original[byte_offset]:
+                hex_start = 10 + i * 3
+                hex_end = hex_start + 2
+                text.tag_add("modified", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
+    
+    def highlight_byte(self, offset):
+        text = self.text
+        content = self.content
+        
+        line_num = (offset // 16) + 3
+        line_start = f"{line_num}.0"
+        line_end = f"{line_num + 1}.0"
+        
+        hex_start = 10 + (offset % 16) * 3
+        hex_end = hex_start + 2
+        
+        text.tag_remove("highlight", "1.0", tk.END)
+        text.tag_add("highlight", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
+        text.see(line_start)
 
 class HexEditor:
     def __init__(self, root):
@@ -11,17 +141,12 @@ class HexEditor:
         self.root.title("Hex Wizz")
         self.root.geometry("750x600")
         
-        self.editor_state = {
-            'file_path': None,
-            'content': bytearray(),
-            'original_content': bytearray(),
-            'last_content': bytearray(),
-            'mod_track_window': None,
-            'modifications': {},
-            'mod_track_tree': None,
-            'compare_files': [None, None],
-            'compare_window': None
-        }
+        self.tabs = {}
+        self.current_tab_id = None
+        self.mod_track_window = None
+        self.mod_track_tree = None
+        self.compare_window = None
+        self.compare_files = [None, None]
         
         self.create_widgets()
 
@@ -32,13 +157,13 @@ class HexEditor:
         file_menu.add_command(label="Open", command=self.editor_open_file)
         file_menu.add_command(label="Save", command=self.editor_save_file)
         file_menu.add_separator()
+        file_menu.add_command(label="Close Tab", command=self.close_current_tab)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         menubar.add_cascade(label="File", menu=file_menu)
         
         compare_menu = tk.Menu(menubar, tearoff=0)
-        compare_menu.add_command(label="Select File 1", command=lambda: self.select_compare_file(0))
-        compare_menu.add_command(label="Select File 2", command=lambda: self.select_compare_file(1))
-        compare_menu.add_command(label="Find Differences", command=self.find_differences)
+        compare_menu.add_command(label="Compare Files", command=self.open_compare_window)
         menubar.add_cascade(label="Compare", menu=compare_menu)
         
         search_menu = tk.Menu(menubar, tearoff=0)
@@ -87,24 +212,367 @@ class HexEditor:
         self.hex_entry.bind("<FocusIn>", lambda e: self.hex_entry.select_range(0, 'end'))
         self.int_entry.bind("<FocusIn>", lambda e: self.int_entry.select_range(0, 'end'))
         
-        self.text = tk.Text(main_frame, wrap="none", font=("Courier", 10))
-        self.text.pack(expand=1, fill="both", padx=5, pady=5)
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(expand=1, fill="both", padx=5, pady=5)
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         
-        scrollbar = ttk.Scrollbar(self.text)
-        scrollbar.pack(side="right", fill="y")
-        self.text.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.text.yview)
+        self.add_new_tab("Untitled")
         
-        self.text.tag_configure("highlight", background="lightblue")
-        self.text.tag_configure("modified", foreground="orange")
-        self.text.tag_configure("diff", foreground="red")
-        self.text.tag_configure("string_highlight", background="lightgreen")
+    def add_new_tab(self, title):
+        tab_id = f"tab_{len(self.tabs)}"
+        new_tab = HexEditorTab(self.notebook, self)
+        self.tabs[tab_id] = new_tab
+        self.notebook.add(new_tab.frame, text=title)
+        self.notebook.select(new_tab.frame)
+        self.current_tab_id = tab_id
+        return new_tab
         
-        self.text.bind("<KeyRelease>", lambda e: self.track_text_edits())
+    def close_current_tab(self):
+        if len(self.tabs) <= 1:
+            messagebox.showwarning("Warning", "Cannot close the last tab")
+            return
+            
+        current_tab = self.get_current_tab()
+        if current_tab.modifications:
+            if not messagebox.askyesno("Confirm", "This tab has unsaved changes. Close anyway?"):
+                return
+                
+        tab_id = self.current_tab_id
+        self.notebook.forget(current_tab.frame)
+        del self.tabs[tab_id]
         
+        if self.tabs:
+            first_tab_id = next(iter(self.tabs))
+            self.notebook.select(self.tabs[first_tab_id].frame)
+            self.current_tab_id = first_tab_id
+            
+    def on_tab_changed(self, event):
+        selected_tab = self.notebook.select()
+        if not selected_tab:
+            return
+            
+        for tab_id, tab in self.tabs.items():
+            if tab.frame == self.notebook.nametowidget(selected_tab):
+                self.current_tab_id = tab_id
+                if self.mod_track_tree:
+                    self.update_mod_track_window()
+                break
+                
+    def get_current_tab(self):
+        if self.current_tab_id in self.tabs:
+            return self.tabs[self.current_tab_id]
+        return None
         
+    def editor_open_file(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            try:
+                with open(file_path, "rb") as file:
+                    content = bytearray(file.read())
+                    
+                    for tab_id, tab in self.tabs.items():
+                        if tab.file_path == file_path:
+                            self.notebook.select(tab.frame)
+                            self.current_tab_id = tab_id
+                            messagebox.showinfo("Info", f"File already open in tab: {self.notebook.tab('current')['text']}")
+                            return
+                    
+                    current_tab = self.get_current_tab()
+                    if current_tab.file_path is None and not current_tab.content and self.notebook.tab('current')['text'] == "Untitled":
+                        tab_title = file_path.split('/')[-1]
+                        self.notebook.tab('current', text=tab_title)
+                    else:
+                        tab_title = file_path.split('/')[-1]
+                        current_tab = self.add_new_tab(tab_title)
+                    
+                    current_tab.file_path = file_path
+                    current_tab.content = content
+                    current_tab.original_content = bytearray(content)
+                    current_tab.last_content = bytearray(content)
+                    current_tab.modifications = {}
+                    current_tab.display_content()
+                    
+                    if self.mod_track_tree:
+                        self.update_mod_track_window()
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open file: {e}")
+                
+    def editor_save_file(self):
+        current_tab = self.get_current_tab()
+        if not current_tab or not current_tab.content:
+            messagebox.showwarning("Warning", "No content to save.")
+            return
+            
+        if not current_tab.modifications:
+            messagebox.showinfo("Info", "No modifications to save.")
+            return
+            
+        file_path = filedialog.asksaveasfilename(
+            title="Save File As",
+            defaultextension=".bin",
+            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, "wb") as file:
+                file.write(current_tab.content)
+            
+            current_tab.original_content = bytearray(current_tab.content)
+            current_tab.modifications = {}
+            current_tab.file_path = file_path
+            tab_title = file_path.split('/')[-1]
+            self.notebook.tab(current_tab.frame, text=tab_title)
+            
+            if self.mod_track_tree:
+                self.update_mod_track_window()
+                
+            messagebox.showinfo("Success", f"File saved successfully as:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save file: {e}")
+
+    def editor_goto_offset(self):
+        current_tab = self.get_current_tab()
+        if not current_tab or not current_tab.content:
+            messagebox.showwarning("Warning", "No file is currently open.")
+            return
+            
+        offset_str = simpledialog.askstring("Goto Offset", "Enter offset in hex (e.g., '000000A0' or 'A0+1'):")
+        if offset_str:
+            try:
+                offset = self.parse_hex_offset(offset_str)
+                if offset < 0 or offset >= len(current_tab.content):
+                    messagebox.showwarning("Warning", f"Offset out of range (0-{len(current_tab.content)-1:08X})")
+                    return
+                current_tab.highlight_byte(offset)
+            except ValueError as e:
+                messagebox.showerror("Error", f"Invalid offset format: {e}")
+
+    def parse_hex_offset(self, offset_str):
+        offset_str = offset_str.replace(" ", "")
+        
+        if '+' in offset_str:
+            parts = offset_str.split('+')
+            if len(parts) != 2:
+                raise ValueError("Invalid offset addition format")
+            base = int(parts[0], 16)
+            add = int(parts[1], 10)
+            return base + add
+        else:
+            return int(offset_str, 16)
+
+    def open_mod_track_window(self):
+        if self.mod_track_window is None or not self.mod_track_window.winfo_exists():
+            mod_window = tk.Toplevel(self.root)
+            mod_window.title("Modification Tracker")
+            mod_window.geometry("350x350")
+            
+            self.mod_track_window = mod_window
+            
+            tree = ttk.Treeview(mod_window, columns=("Offset", "From", "To", "Action"), show="headings")
+            tree.heading("Offset", text="Offset")
+            tree.heading("From", text="From")
+            tree.heading("To", text="To")
+            tree.heading("Action", text="Action")
+            tree.column("Offset", width=100)
+            tree.column("From", width=50)
+            tree.column("To", width=50)
+            tree.column("Action", width=80)
+            tree.pack(fill="both", expand=True, padx=5, pady=5)
+            
+            self.mod_track_tree = tree
+            
+            scrollbar = ttk.Scrollbar(mod_window, orient="vertical", command=tree.yview)
+            scrollbar.pack(side="right", fill="y")
+            tree.configure(yscrollcommand=scrollbar.set)
+            
+            self.update_mod_track_window()
+            
+            mod_window.protocol("WM_DELETE_WINDOW", self.close_mod_track_window)
+            
+    def close_mod_track_window(self):
+        if self.mod_track_window:
+            self.mod_track_window.destroy()
+            self.mod_track_window = None
+            self.mod_track_tree = None
+    
+    def update_mod_track_window(self):
+        if self.mod_track_tree is None:
+            return
+            
+        current_tab = self.get_current_tab()
+        if not current_tab:
+            return
+            
+        tree = self.mod_track_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        
+        for offset, (old_val, new_val) in current_tab.modifications.items():
+            tree.insert("", "end", values=(
+                f"{offset:08X}",
+                f"{old_val:02X}",
+                f"{new_val:02X}",
+                "Revert"
+            ), tags=("editable",))
+        
+        tree.tag_bind("editable", "<Button-1>", self.handle_mod_track_click)
+        
+    def handle_mod_track_click(self, event):
+        tree = self.mod_track_tree
+        item = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        
+        if item and col == "#4":
+            values = tree.item(item, "values")
+            offset = int(values[0], 16)
+            self.revert_modification(offset)
+    
+    def revert_modification(self, offset):
+        current_tab = self.get_current_tab()
+        if not current_tab:
+            return
+            
+        if offset in current_tab.modifications:
+            old_val = current_tab.modifications[offset][0]
+            current_tab.content[offset] = old_val
+            del current_tab.modifications[offset]
+            
+            current_tab.display_content()
+            self.update_mod_track_window()
+
+    def open_compare_window(self):
+        if len(self.tabs) < 2:
+            messagebox.showwarning("Warning", "Need at least 2 open files to compare")
+            return
+            
+        if self.compare_window is None or not self.compare_window.winfo_exists():
+            compare_window = tk.Toplevel(self.root)
+            compare_window.title("Compare Files")
+            compare_window.geometry("600x400")
+            self.compare_window = compare_window
+            
+            main_frame = tk.Frame(compare_window)
+            main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            
+            # File selection
+            selection_frame = tk.Frame(main_frame)
+            selection_frame.pack(fill="x", padx=5, pady=5)
+            
+            tk.Label(selection_frame, text="File 1:").pack(side="left")
+            self.compare_file1_var = tk.StringVar()
+            file1_menu = ttk.OptionMenu(selection_frame, self.compare_file1_var, "", *[self.notebook.tab(tab.frame, "text") for tab in self.tabs.values()])
+            file1_menu.pack(side="left", padx=5)
+            
+            tk.Label(selection_frame, text="File 2:").pack(side="left")
+            self.compare_file2_var = tk.StringVar()
+            file2_menu = ttk.OptionMenu(selection_frame, self.compare_file2_var, "", *[self.notebook.tab(tab.frame, "text") for tab in self.tabs.values()])
+            file2_menu.pack(side="left", padx=5)
+            
+            # Value filters
+            filter_frame = tk.Frame(main_frame)
+            filter_frame.pack(fill="x", padx=5, pady=5)
+            
+            tk.Label(filter_frame, text="Value in File 1 (hex):").pack(side="left")
+            self.compare_val1_entry = tk.Entry(filter_frame, width=5)
+            self.compare_val1_entry.pack(side="left", padx=5)
+            
+            tk.Label(filter_frame, text="Value in File 2 (hex):").pack(side="left")
+            self.compare_val2_entry = tk.Entry(filter_frame, width=5)
+            self.compare_val2_entry.pack(side="left", padx=5)
+            
+            # Buttons
+            button_frame = tk.Frame(main_frame)
+            button_frame.pack(fill="x", padx=5, pady=5)
+            
+            compare_button = tk.Button(button_frame, text="Compare", command=self.do_compare)
+            compare_button.pack(side="left", padx=2)
+            
+            # Results
+            results_frame = ttk.LabelFrame(main_frame, text="Comparison Results")
+            results_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            
+            self.compare_results_text = tk.Text(results_frame, wrap="none", font=("Courier", 10))
+            self.compare_results_text.pack(fill="both", expand=True, padx=2, pady=2)
+            
+            scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.compare_results_text.yview)
+            scrollbar.pack(side="right", fill="y")
+            self.compare_results_text.config(yscrollcommand=scrollbar.set)
+            
+            self.compare_results_text.tag_configure("diff", foreground="red")
+            
+    def do_compare(self):
+        file1_name = self.compare_file1_var.get()
+        file2_name = self.compare_file2_var.get()
+        
+        if not file1_name or not file2_name:
+            messagebox.showwarning("Warning", "Please select both files to compare")
+            return
+            
+        if file1_name == file2_name:
+            messagebox.showwarning("Warning", "Cannot compare a file with itself")
+            return
+            
+        file1_tab = None
+        file2_tab = None
+        for tab in self.tabs.values():
+            if self.notebook.tab(tab.frame, "text") == file1_name:
+                file1_tab = tab
+            elif self.notebook.tab(tab.frame, "text") == file2_name:
+                file2_tab = tab
+                
+        if not file1_tab or not file2_tab:
+            messagebox.showerror("Error", "Could not find selected files")
+            return
+            
+        content1 = file1_tab.content
+        content2 = file2_tab.content
+        
+        try:
+            val1 = self.compare_val1_entry.get().strip()
+            val1 = int(val1, 16) if val1 else None
+            
+            val2 = self.compare_val2_entry.get().strip()
+            val2 = int(val2, 16) if val2 else None
+        except ValueError:
+            messagebox.showerror("Error", "Invalid hex value")
+            return
+            
+        self.compare_results_text.delete(1.0, tk.END)
+        self.compare_results_text.insert(tk.END, f"Comparing:\nFile 1: {file1_name}\nFile 2: {file2_name}\n\n")
+        self.compare_results_text.insert(tk.END, "Offsets with differences:\n")
+
+        address = 0
+        max_length = max(len(content1), len(content2))
+
+        for i in range(0, max_length, 16):
+            chunk1 = content1[i:i+16] if i < len(content1) else []
+            chunk2 = content2[i:i+16] if i < len(content2) else []
+
+            found_diff = False
+            for j in range(max(len(chunk1), len(chunk2))):
+                b1 = chunk1[j] if j < len(chunk1) else None
+                b2 = chunk2[j] if j < len(chunk2) else None
+                
+                if (val1 is not None and val2 is not None):
+                    if b1 == val1 and b2 == val2:
+                        found_diff = True
+                        break
+                else:
+                    if b1 != b2:
+                        found_diff = True
+                        break
+
+            if found_diff:
+                self.compare_results_text.insert(tk.END, f"{address:08X}\n")
+
+            address += 16
+
     def open_find_strings_window(self):
-        if not self.editor_state['content']:
+        current_tab = self.get_current_tab()
+        if not current_tab or not current_tab.content:
             messagebox.showwarning("Warning", "No file is currently open.")
             return
             
@@ -115,7 +583,8 @@ class HexEditor:
         self.string_search_state = {
             'current_pos': 0,
             'found_positions': [],
-            'search_window': strings_window
+            'search_window': strings_window,
+            'current_tab': current_tab
         }
         
         main_frame = tk.Frame(strings_window)
@@ -196,11 +665,12 @@ class HexEditor:
         self.string_results_text.bind("<Double-Button-1>", self.on_string_result_click)
 
     def find_strings(self):
-        if not self.editor_state['content']:
+        current_tab = self.get_current_tab()
+        if not current_tab or not current_tab.content:
             messagebox.showwarning("Warning", "No file is currently open.")
             return
             
-        content = self.editor_state['content']
+        content = current_tab.content
         search_type = self.string_search_type.get()
         
         ignore_chars = [char for char, var in self.punct_vars.items() if var.get()]
@@ -233,7 +703,6 @@ class HexEditor:
         self.string_search_state['current_pos'] = 0
         
         self.update_string_results_display()
-        
         self.highlight_current_string_match()
 
     def find_strings_in_content(self, content, min_len, max_len, ignore_chars):
@@ -306,10 +775,14 @@ class HexEditor:
         if not self.string_search_state['found_positions']:
             return
             
+        current_tab = self.string_search_state.get('current_tab')
+        if not current_tab:
+            return
+            
         current_pos = self.string_search_state['current_pos']
         start, end, _ = self.string_search_state['found_positions'][current_pos]
         
-        self.text.tag_remove("string_highlight", "1.0", tk.END)
+        current_tab.text.tag_remove("string_highlight", "1.0", tk.END)
         
         start_line = (start // 16) + 3
         end_line = (end // 16) + 3
@@ -318,13 +791,10 @@ class HexEditor:
             line_num = (offset // 16) + 3
             hex_start = 10 + (offset % 16) * 3
             hex_end = hex_start + 2
-            self.text.tag_add("string_highlight", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
+            current_tab.text.tag_add("string_highlight", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
         
-        self.text.see(f"{start_line}.0")
-        
+        current_tab.text.see(f"{start_line}.0")
         self.update_string_results_display()
-        #messagebox.showinfo("String Search", 
-        #           f"Match {current_pos + 1} of {len(self.string_search_state['found_positions'])}")
 
     def on_string_result_click(self, event):
         index = self.string_results_text.index(f"@{event.x},{event.y}")
@@ -334,82 +804,12 @@ class HexEditor:
             self.string_search_state['current_pos'] = line_num - 1
             self.highlight_current_string_match()
 
-    
-    
-
-
-    def select_compare_file(self, index):
-        file_path = filedialog.askopenfilename()
-        if file_path:
-            try:
-                with open(file_path, "rb") as file:
-                    self.editor_state['compare_files'][index] = (file_path, file.read())
-                    messagebox.showinfo("Info", f"File {index+1} selected: {file_path}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not open file: {e}")
-
-    def find_differences(self):
-        file1 = self.editor_state['compare_files'][0]
-        file2 = self.editor_state['compare_files'][1]
-        
-        if file1 is None or file2 is None:
-            messagebox.showwarning("Warning", "Please select both files to compare.")
-            return
-
-        content1 = file1[1]
-        content2 = file2[1]
-
-        val1 = simpledialog.askinteger("Input", "Enter the value in File 1 (hex) or Cancel for all differences:", 
-                                      minvalue=0, maxvalue=255)
-        val2 = simpledialog.askinteger("Input", "Enter the value in File 2 (hex) or Cancel for all differences:", 
-                                      minvalue=0, maxvalue=255)
-
-        if self.editor_state['compare_window'] is None or not self.editor_state['compare_window'].winfo_exists():
-            compare_window = tk.Toplevel(self.root)
-            compare_window.title("Comparison Results")
-            compare_window.geometry("800x600")
-            self.editor_state['compare_window'] = compare_window
-            
-            diff_text = tk.Text(compare_window, wrap="none", font=("Courier", 10))
-            diff_text.pack(expand=1, fill="both", padx=5, pady=5)
-            
-            diff_text.tag_configure("diff", foreground="red")
-            
-            self.editor_state['compare_text'] = diff_text
-        else:
-            diff_text = self.editor_state['compare_text']
-            diff_text.delete(1.0, tk.END)
-        
-        diff_text.insert(tk.END, f"Comparing:\nFile 1: {file1[0]}\nFile 2: {file2[0]}\n\n")
-        diff_text.insert(tk.END, "Offsets with differences:\n")
-
-        address = 0
-        max_length = max(len(content1), len(content2))
-
-        for i in range(0, max_length, 16):
-            chunk1 = content1[i:i+16] if i < len(content1) else []
-            chunk2 = content2[i:i+16] if i < len(content2) else []
-
-            found_diff = False
-            for j in range(max(len(chunk1), len(chunk2))):
-                b1 = chunk1[j] if j < len(chunk1) else None
-                b2 = chunk2[j] if j < len(chunk2) else None
-                
-                if (val1 is not None and val2 is not None):
-                    if b1 == val1 and b2 == val2:
-                        found_diff = True
-                        break
-                else:
-                    if b1 != b2:
-                        found_diff = True
-                        break
-
-            if found_diff:
-                diff_text.insert(tk.END, f"{address:08X}\n")
-
-            address += 16
-
     def open_search_window(self):
+        current_tab = self.get_current_tab()
+        if not current_tab or not current_tab.content:
+            messagebox.showwarning("Warning", "No file is currently open.")
+            return
+            
         search_window = tk.Toplevel(self.root)
         search_window.title("Search Options")
         search_window.geometry("400x350")
@@ -417,7 +817,8 @@ class HexEditor:
         self.search_state = {
             'current_pos': 0,
             'found_positions': [],
-            'search_window': search_window
+            'search_window': search_window,
+            'current_tab': current_tab
         }
         
         notebook = ttk.Notebook(search_window)
@@ -546,7 +947,7 @@ class HexEditor:
                 
             self.string_search_state['current_pos'] -= 1
             if self.string_search_state['current_pos'] < 0:
-                self.string_search_state['current_pos'] = len(self.string_search_state['found_positions']) - 1  # Wrap around
+                self.string_search_state['current_pos'] = len(self.string_search_state['found_positions']) - 1
                 
             self.highlight_current_string_match()
         else:
@@ -565,45 +966,40 @@ class HexEditor:
                 
             self.highlight_current_match()
 
-
     def highlight_current_match(self):
         if not self.search_state['found_positions']:
             return
         
+        current_tab = self.search_state.get('current_tab')
+        if not current_tab:
+            return
+            
         current_pos = self.search_state['current_pos']
         
-        # First remove all highlights
-        self.text.tag_remove("highlight", "1.0", tk.END)
+        current_tab.text.tag_remove("highlight", "1.0", tk.END)
         
         if isinstance(self.search_state['found_positions'][0], tuple):
-            # Advanced search result (pair of positions)
             pos1, pos2 = self.search_state['found_positions'][current_pos]
             
-            # Highlight first position
             line_num1 = (pos1 // 16) + 3
             hex_start1 = 10 + (pos1 % 16) * 3
             hex_end1 = hex_start1 + 2
-            self.text.tag_add("highlight", f"{line_num1}.{hex_start1}", f"{line_num1}.{hex_end1}")
+            current_tab.text.tag_add("highlight", f"{line_num1}.{hex_start1}", f"{line_num1}.{hex_end1}")
             
-            # Highlight second position
             line_num2 = (pos2 // 16) + 3
             hex_start2 = 10 + (pos2 % 16) * 3
             hex_end2 = hex_start2 + 2
-            self.text.tag_add("highlight", f"{line_num2}.{hex_start2}", f"{line_num2}.{hex_end2}")
+            current_tab.text.tag_add("highlight", f"{line_num2}.{hex_start2}", f"{line_num2}.{hex_end2}")
             
-            # Make sure both lines are visible
-            self.text.see(f"{line_num1}.0")
-            self.text.see(f"{line_num2}.0")
+            current_tab.text.see(f"{line_num1}.0")
+            current_tab.text.see(f"{line_num2}.0")
         else:
-            # Simple search result (single position)
             pos = self.search_state['found_positions'][current_pos]
-            self.editor_highlight_byte(pos)
-        
-        #messagebox.showinfo("Search", 
-        #                   f"Match {current_pos + 1} of {len(self.search_state['found_positions'])}")
+            current_tab.highlight_byte(pos)
 
     def search_hex_pattern(self):
-        if not self.editor_state['content']:
+        current_tab = self.search_state.get('current_tab')
+        if not current_tab or not current_tab.content:
             messagebox.showwarning("Warning", "No file is currently open.")
             return
             
@@ -624,7 +1020,7 @@ class HexEditor:
                     else:
                         pattern_bytes.append(int(clean_byte, 16))
             
-            content = self.editor_state['content']
+            content = current_tab.content
             found_positions = []
             
             for i in range(len(content) - len(pattern_bytes) + 1):
@@ -640,7 +1036,7 @@ class HexEditor:
             if found_positions:
                 self.search_state['found_positions'] = found_positions
                 self.search_state['current_pos'] = 0
-                self.text.tag_remove("highlight", "1.0", tk.END)
+                current_tab.text.tag_remove("highlight", "1.0", tk.END)
                 self.highlight_current_match()
             else:
                 messagebox.showinfo("Search", "Pattern not found.")
@@ -648,7 +1044,8 @@ class HexEditor:
             messagebox.showerror("Error", "Invalid hex pattern")
 
     def search_int_value(self):
-        if not self.editor_state['content']:
+        current_tab = self.search_state.get('current_tab')
+        if not current_tab or not current_tab.content:
             messagebox.showwarning("Warning", "No file is currently open.")
             return
             
@@ -662,7 +1059,7 @@ class HexEditor:
             if int_val < 0 or int_val > 255:
                 raise ValueError("Value out of range")
                 
-            content = self.editor_state['content']
+            content = current_tab.content
             found_positions = []
             
             for i in range(len(content)):
@@ -672,7 +1069,7 @@ class HexEditor:
             if found_positions:
                 self.search_state['found_positions'] = found_positions
                 self.search_state['current_pos'] = 0
-                self.text.tag_remove("highlight", "1.0", tk.END)
+                current_tab.text.tag_remove("highlight", "1.0", tk.END)
                 self.highlight_current_match()
             else:
                 messagebox.showinfo("Search", "Value not found.")
@@ -680,7 +1077,8 @@ class HexEditor:
             messagebox.showerror("Error", "Invalid integer value (must be 0-255)")
 
     def advanced_search(self):
-        if not self.editor_state['content']:
+        current_tab = self.search_state.get('current_tab')
+        if not current_tab or not current_tab.content:
             messagebox.showwarning("Warning", "No file is currently open.")
             return
             
@@ -706,7 +1104,7 @@ class HexEditor:
             pattern2_bytes = parse_pattern(pattern2)
             max_range = int(range_str)
             
-            content = self.editor_state['content']
+            content = current_tab.content
             found_positions = []
             
             pattern1_positions = []
@@ -737,7 +1135,7 @@ class HexEditor:
             if found_positions:
                 self.search_state['found_positions'] = found_positions
                 self.search_state['current_pos'] = 0
-                self.text.tag_remove("highlight", "1.0", tk.END)
+                current_tab.text.tag_remove("highlight", "1.0", tk.END)
                 self.highlight_current_match()
             else:
                 messagebox.showinfo("Search", "No matching pairs found.")
@@ -782,290 +1180,6 @@ class HexEditor:
                 hex_entry.insert(0, hex_value)
         except ValueError:
             messagebox.showerror("Error", "Invalid integer value")
-        
-    def open_mod_track_window(self):
-        if self.editor_state['mod_track_window'] is None or not self.editor_state['mod_track_window'].winfo_exists():
-            mod_window = tk.Toplevel(self.root)
-            mod_window.title("Modification Tracker")
-            mod_window.geometry("350x350")
-            
-            self.editor_state['mod_track_window'] = mod_window
-            
-            tree = ttk.Treeview(mod_window, columns=("Offset", "From", "To", "Action"), show="headings")
-            tree.heading("Offset", text="Offset")
-            tree.heading("From", text="From")
-            tree.heading("To", text="To")
-            tree.heading("Action", text="Action")
-            tree.column("Offset", width=100)
-            tree.column("From", width=50)
-            tree.column("To", width=50)
-            tree.column("Action", width=80)
-            tree.pack(fill="both", expand=True, padx=5, pady=5)
-            
-            self.editor_state['mod_track_tree'] = tree
-            
-            scrollbar = ttk.Scrollbar(mod_window, orient="vertical", command=tree.yview)
-            scrollbar.pack(side="right", fill="y")
-            tree.configure(yscrollcommand=scrollbar.set)
-            
-            self.update_mod_track_window()
-            
-            mod_window.protocol("WM_DELETE_WINDOW", self.close_mod_track_window)
-            
-    def close_mod_track_window(self):
-        if self.editor_state['mod_track_window']:
-            self.editor_state['mod_track_window'].destroy()
-            self.editor_state['mod_track_window'] = None
-            self.editor_state['mod_track_tree'] = None
-    
-    def update_mod_track_window(self):
-        if self.editor_state['mod_track_tree'] is None:
-            return
-            
-        tree = self.editor_state['mod_track_tree']
-        for item in tree.get_children():
-            tree.delete(item)
-        
-        for offset, (old_val, new_val) in self.editor_state['modifications'].items():
-            tree.insert("", "end", values=(
-                f"{offset:08X}",
-                f"{old_val:02X}",
-                f"{new_val:02X}",
-                "Revert"
-            ), tags=("editable",))
-        
-        tree.tag_bind("editable", "<Button-1>", self.handle_mod_track_click)
-        
-    def handle_mod_track_click(self, event):
-        tree = self.editor_state['mod_track_tree']
-        item = tree.identify_row(event.y)
-        col = tree.identify_column(event.x)
-        
-        if item and col == "#4":
-            values = tree.item(item, "values")
-            offset = int(values[0], 16)
-            self.revert_modification(offset)
-    
-    def revert_modification(self, offset):
-        if offset in self.editor_state['modifications']:
-            old_val = self.editor_state['modifications'][offset][0]
-            self.editor_state['content'][offset] = old_val
-            del self.editor_state['modifications'][offset]
-            
-            self.editor_display_content()
-            self.update_mod_track_window()
-
-    def editor_open_file(self):
-        file_path = filedialog.askopenfilename()
-        if file_path:
-            try:
-                with open(file_path, "rb") as file:
-                    self.editor_state['content'] = bytearray(file.read())
-                    self.editor_state['original_content'] = bytearray(self.editor_state['content'])
-                    self.editor_state['last_content'] = bytearray(self.editor_state['content'])
-                    self.editor_state['file_path'] = file_path
-                    self.editor_state['modifications'] = {}
-                    self.editor_display_content()
-                    if self.editor_state['mod_track_tree']:
-                        self.update_mod_track_window()
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not open file: {e}")
-                
-    def track_text_edits(self):
-        """More efficient version that only checks the current line being edited"""
-        text = self.text
-        
-        cursor_pos = text.index(tk.INSERT)
-        line_num = int(cursor_pos.split('.')[0])
-        
-        if line_num < 3:
-            return
-        
-        offset = (line_num - 3) * 16
-        
-        line_content = text.get(f"{line_num}.0", f"{line_num}.end")
-        
-        hex_part = line_content[10:58]
-        hex_bytes = hex_part.split()
-        
-        for i, byte_str in enumerate(hex_bytes):
-            if len(byte_str) == 2:
-                try:
-                    new_val = int(byte_str, 16)
-                    byte_offset = offset + i
-                    
-                    if byte_offset < len(self.editor_state['content']):
-                        current_val = self.editor_state['content'][byte_offset]
-                        
-                        if new_val != current_val:
-                            self.editor_state['content'][byte_offset] = new_val
-                            
-                            if byte_offset < len(self.editor_state['original_content']):
-                                old_val = self.editor_state['original_content'][byte_offset]
-                                if new_val != old_val:
-                                    self.editor_state['modifications'][byte_offset] = (old_val, new_val)
-                                elif byte_offset in self.editor_state['modifications']:
-                                    del self.editor_state['modifications'][byte_offset]
-                except ValueError:
-                    pass
-        
-        self.editor_state['last_content'] = bytearray(self.editor_state['content'])
-        
-        self.highlight_modified_bytes_in_line(line_num)
-        
-        if self.editor_state['mod_track_tree']:
-            self.update_mod_track_window()
-            
-    def highlight_modified_bytes_in_line(self, line_num):
-        text = self.text
-        content = self.editor_state['content']
-        original = self.editor_state['original_content']
-        
-        text.tag_remove("modified", f"{line_num}.0", f"{line_num}.end")
-        
-        offset = (line_num - 3) * 16
-        
-        for i in range(16):
-            byte_offset = offset + i
-            if byte_offset >= len(content) or byte_offset >= len(original):
-                break
-                
-            if content[byte_offset] != original[byte_offset]:
-                hex_start = 10 + i * 3
-                hex_end = hex_start + 2
-                text.tag_add("modified", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
-            
-    def highlight_modified_bytes(self):
-        text = self.text
-        content = self.editor_state['content']
-        original = self.editor_state['last_content']
-        
-        text.tag_remove("modified", "1.0", tk.END)
-        
-        if len(content) != len(original):
-            return
-            
-        address = 0
-        for i in range(0, len(content), 16):
-            line_num = i // 16 + 3
-            line_start = f"{line_num}.0"
-            
-            for j in range(16):
-                if i + j >= len(content):
-                    break
-                    
-                if content[i+j] != original[i+j]:
-                    hex_start = 10 + j * 3
-                    hex_end = hex_start + 2
-                    text.tag_add("modified", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
-                    
-            address += 16
-
-    def editor_save_file(self):
-        if len(self.editor_state['content']) == 0:
-            messagebox.showwarning("Warning", "No content to save.")
-            return
-            
-        if not self.editor_state['modifications']:
-            messagebox.showinfo("Info", "No modifications to save.")
-            return
-            
-        file_path = filedialog.asksaveasfilename(
-            title="Save File As",
-            defaultextension=".bin",
-            filetypes=[("Binary files", "*.bin"), ("All files", "*.*")]
-        )
-        
-        if not file_path:
-            return
-            
-        try:
-            with open(file_path, "wb") as file:
-                file.write(self.editor_state['content'])
-            
-            self.editor_state['original_content'] = bytearray(self.editor_state['content'])
-            self.editor_state['modifications'] = {}
-            
-            if self.editor_state['mod_track_tree']:
-                self.update_mod_track_window()
-                
-            messagebox.showinfo("Success", f"File saved successfully as:\n{file_path}")
-            self.editor_state['file_path'] = file_path
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not save file: {e}")
-
-    def editor_display_content(self):
-        text = self.text
-        content = self.editor_state['content']
-        
-        text.delete(1.0, tk.END)
-        
-        header = "Offset    "
-        hex_header = ""
-        ascii_header = "  "
-        
-        for i in range(16):
-            hex_header += f"{i:02X} "
-        
-        for i in range(16):
-            ascii_header += f"{i:1X}"
-        
-        text.insert(tk.END, f"{header}{hex_header} {ascii_header}\n")
-        text.insert(tk.END, ("-" * len(header)) + " " + ("-" * len(hex_header)) + " " + ("-" * len(ascii_header)) + "\n")
-        
-        address = 0
-        for i in range(0, len(content), 16):
-            chunk = content[i:i+16]
-            hex_bytes = " ".join(f"{b:02X}" for b in chunk)
-            ascii_bytes = "".join(chr(b) if 32 <= b <= 127 else "." for b in chunk)
-            text.insert(tk.END, f"{address:08X}  {hex_bytes:<48}  {ascii_bytes}\n")
-            address += 16
-
-    def editor_goto_offset(self):
-        if not self.editor_state['content']:
-            messagebox.showwarning("Warning", "No file is currently open.")
-            return
-            
-        offset_str = simpledialog.askstring("Goto Offset", "Enter offset in hex (e.g., '000000A0' or 'A0+1'):")
-        if offset_str:
-            try:
-                offset = self.parse_hex_offset(offset_str)
-                if offset < 0 or offset >= len(self.editor_state['content']):
-                    messagebox.showwarning("Warning", f"Offset out of range (0-{len(self.editor_state['content'])-1:08X})")
-                    return
-                self.editor_highlight_byte(offset)
-            except ValueError as e:
-                messagebox.showerror("Error", f"Invalid offset format: {e}")
-
-    def parse_hex_offset(self, offset_str):
-        offset_str = offset_str.replace(" ", "")
-        
-        if '+' in offset_str:
-            parts = offset_str.split('+')
-            if len(parts) != 2:
-                raise ValueError("Invalid offset addition format")
-            base = int(parts[0], 16)
-            add = int(parts[1], 10)
-            return base + add
-        else:
-            return int(offset_str, 16)
-
-    def editor_highlight_byte(self, offset):
-        text = self.text
-        content = self.editor_state['content']
-        
-        line_num = (offset // 16) + 3
-        line_start = f"{line_num}.0"
-        line_end = f"{line_num + 1}.0"
-        
-        hex_start = 10 + (offset % 16) * 3
-        hex_end = hex_start + 2
-        
-        text.tag_remove("highlight", "1.0", tk.END)
-        
-        text.tag_add("highlight", f"{line_num}.{hex_start}", f"{line_num}.{hex_end}")
-        
-        text.see(line_start)
 
 if __name__ == "__main__":
     root = tk.Tk()
