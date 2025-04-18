@@ -7,7 +7,7 @@ simple Hex editor in python with only the functions i found more usefull when mo
 
 # hex/int quick converter tool
 
-# compare options between to files
+# compare options between two files in diferent tabs
 
 # search options for strings
 
